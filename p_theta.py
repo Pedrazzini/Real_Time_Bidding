@@ -16,7 +16,6 @@ def bootstrap_task_action(rng, X, Y, T=None):
     return X[idx], Y[idx]
 
 
-
 def build_summary_stats(X, Y, ridge=1.0):
     """
     Per ogni t = 1,...,T calcola, usando SOLO la storia s < t:
@@ -27,21 +26,23 @@ def build_summary_stats(X, Y, ridge=1.0):
     """
     T, d_x = X.shape
 
-    outer = np.einsum('ti,tj->tij', X, X)              # (T, d_x, d_x)
-    cum_outer = np.cumsum(outer, axis=0)  #---> per ora ho una lista di matrici 5x5 dove la prima è X-1^(T)X_1 (ove la matrice X_1 è una matrice 1x5), la seconda è X_2^(T)X_2 (ove la matrice X_2 è una matrice 2x5)... ecc
-    cum_outer_excl = np.concatenate(
-        [np.zeros((1, d_x, d_x)), cum_outer[:-1]], axis=0
-    )
+    outer = np.einsum('ti,tj->tij', X, X)
+    cum_outer = np.cumsum(outer, axis=0)
+    cum_outer_excl = np.concatenate([np.zeros((1, d_x, d_x)), cum_outer[:-1]], axis=0)
 
     cum_XY = np.cumsum(X * Y[:, None], axis=0)
-    cum_XY_excl = np.concatenate(
-        [np.zeros((1, d_x)), cum_XY[:-1]], axis=0
-    )
+    cum_XY_excl = np.concatenate([np.zeros((1, d_x)), cum_XY[:-1]], axis=0)
+
+    counts = np.arange(T).reshape(-1, 1, 1)          # numero di osservazioni nella storia: 0,1,...,T-1
+    counts_flat = counts.reshape(-1, 1)
 
     S = cum_outer_excl + ridge * np.eye(d_x)[None, :, :]
-    S_inv = np.linalg.inv(S)                            # (T, d_x, d_x), batch invert
+    S_inv = np.linalg.inv(S)
 
-    return S_inv, cum_XY_excl
+    XY_mean = cum_XY_excl / np.maximum(counts_flat, 1)   # ora è una MEDIA, scala ~O(1)
+
+    return S_inv, XY_mean
+
 
 
 def build_training_examples(Z, X, Y, repeat_factor=100, ridge=1.0):
@@ -163,22 +164,22 @@ import pickle
 # Ridefinisci la variabile nel nuovo notebook
 output_dir = Path("data")
 
-with open(output_dir / "offline_dataset.pkl", "rb") as f:
+with open(output_dir / "offline_dataset_paper.pkl", "rb") as f:
     loaded = pickle.load(f)
 
 train_data = loaded["train_data"]
 val_data = loaded["val_data"]
 config = loaded["config"]
 
-print("CUDA available?:", torch.cuda.is_available())
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Training will run on: {device}")
 
-device = "cpu" # sovrascrivo di nuovo il device e lo imposto come CPU, perchè ha più RAM (anche se lenta) della GPU e riesce a processare tutti i dati
+device = "cpu" 
 
 model, history = train_p_theta(
     train_data, val_data,
-    n_epochs=50, batch_size=500, # provo con 50 epoche anche se nel paper lo faceva con 100
-    device=device   # <-- passa qui il device rilevato
+    n_epochs=50, batch_size=500,
+    lr=1e-3,
+    device= device
 )
 
+torch.save(model.state_dict(), "p_theta.pt")  
+print("Modello salvato in p_theta.pt")
