@@ -77,4 +77,4 @@ with open(output_dir / "offline_dataset_paper.pkl", "wb") as f:
          "config": {"n_tasks": N_TASKS, "T": T, "d_x": D_X, "d_z": D_Z, "seed": SEED}},
         f,
     )
-print(f"Dataset salvato in: {output_dir / 'offline_dataset_paper.pkl'}")
+print(f"Dataset salvato in: {output_dir / 'offline_dataset_paper.pkl'}")        

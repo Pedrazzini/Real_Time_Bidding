@@ -175,17 +175,140 @@ def generative_ts(model, task, T, n_actions, horizon, seed=0, device="cpu", verb
 
     return {"rewards": rewards, "actions": chosen_actions}
 
-rng_task = np.random.default_rng(42)
-T_TEST = 20
-N_ACTIONS_TEST = 3
-HORIZON = 10  # troncamento: genera al massimo 10 passi nel futuro oltre a t
+#rng_task = np.random.default_rng(42)
+#T_TEST = 100
+#N_ACTIONS_TEST = 3
+#HORIZON = 30  # troncamento: genera al massimo 10 passi nel futuro oltre a t
 
-task = generate_bandit_task(rng_task, T=T_TEST, n_actions=N_ACTIONS_TEST)
+#task = generate_bandit_task(rng_task, T=T_TEST, n_actions=N_ACTIONS_TEST)
 
-result = generative_ts(model, task, T=T_TEST, n_actions=N_ACTIONS_TEST,
-                       horizon=HORIZON, seed=0, device=device)
+#result = generative_ts(model, task, T=T_TEST, n_actions=N_ACTIONS_TEST,
+#                       horizon=HORIZON, seed=0, device=device)
 
-print("\nReward totale:", sum(result["rewards"]))
-print("Reward medio:", np.mean(result["rewards"]))
-print("Distribuzione azioni scelte:", np.bincount(result["actions"], minlength=N_ACTIONS_TEST))
+#print("\nReward totale:", sum(result["rewards"]))
+#print("Reward medio:", np.mean(result["rewards"]))
+#print("Distribuzione azioni scelte:", np.bincount(result["actions"], minlength=N_ACTIONS_TEST))
 
+#######################################################################################################################
+#REGRET COMPUTATION#
+#######################################################################################################################
+
+def fit_full_oracle_policy(X_true, task, n_actions):
+    """
+    Fitta la policy "best-in-hindsight" pi*(.;tau) sull'INTERA tabella di
+    potential outcomes vera (non imputata), come richiesto dalla definizione
+    di regret in (2). Riusa fit_oracle_policies, fingendo che la tabella
+    vera sia "il dataset imputato" (qui non c'è nulla da imputare: è completa).
+    """
+    T = X_true.shape[0]
+    Y_true_dict = {
+        a: {s: int(task["actions"][a]["Y"][s]) for s in range(T)}
+        for a in range(n_actions)
+    }
+    return fit_oracle_policies(X_true, Y_true_dict, n_actions)
+
+
+def compute_regret(task, result, n_actions):
+    X_true = task["X"]
+    T = X_true.shape[0]
+
+    oracle_policies = fit_full_oracle_policy(X_true, task, n_actions)
+
+    oracle_actions, oracle_rewards = [], []
+    for t in range(T):
+        probs = predict_probs(oracle_policies, X_true[t])
+        a_star = int(np.argmax(probs))
+        oracle_actions.append(a_star)
+        oracle_rewards.append(int(task["actions"][a_star]["Y"][t]))
+
+    agent_rewards = np.array(result["rewards"])
+    oracle_rewards = np.array(oracle_rewards)
+
+    per_period_regret = oracle_rewards - agent_rewards      # R(Y^pi*) - R(Y^At), R(y)=y
+    cumulative_regret = np.cumsum(per_period_regret)
+
+    return {
+        "oracle_actions": oracle_actions,
+        "oracle_rewards": oracle_rewards,
+        "per_period_regret": per_period_regret,
+        "cumulative_regret": cumulative_regret,
+        "avg_regret": cumulative_regret / np.arange(1, T + 1),
+    }
+
+#regret_info = compute_regret(task, result, N_ACTIONS_TEST)
+
+#print("Azioni oracle:       ", regret_info["oracle_actions"])
+#print("Azioni agente (TS):  ", result["actions"])
+#print("Regret per periodo:  ", regret_info["per_period_regret"])
+#print("Regret cumulativo:   ", regret_info["cumulative_regret"])
+#print(f"\nRegret cumulativo finale: {regret_info['cumulative_regret'][-1]}")
+#print(f"Regret medio per periodo (finale): {regret_info['avg_regret'][-1]:.3f}")    
+
+
+##################################################################################################
+#PER ESSERE PRECISI FACCIAMO LA MEDIA DEI RISULTATI OTTENUTI SU PIU' TASK DIVERSI#
+##################################################################################################
+
+def run_monte_carlo(model, n_tasks, T, n_actions, horizon, base_seed=0, device="cpu"):
+    all_cum_regret = np.zeros((n_tasks, T))
+
+    for m in range(n_tasks):
+        rng_task = np.random.default_rng(base_seed + m)
+        task = generate_bandit_task(rng_task, T=T, n_actions=n_actions)
+
+        result = generative_ts(model, task, T=T, n_actions=n_actions,
+                               horizon=horizon, seed=base_seed + m,
+                               device=device, verbose=False)
+
+        regret_info = compute_regret(task, result, n_actions)
+        all_cum_regret[m] = regret_info["cumulative_regret"]
+
+        print(f"Task {m+1}/{n_tasks} completato - regret cumulativo finale: {all_cum_regret[m, -1]:.0f}")
+
+    mean_regret = all_cum_regret.mean(axis=0)
+    std_regret = all_cum_regret.std(axis=0)
+    return all_cum_regret, mean_regret, std_regret
+
+
+N_TASKS_MC = 40   # inizia piccolo, poi scala se i tempi lo permettono
+all_regret, mean_regret, std_regret = run_monte_carlo(
+    model, n_tasks=N_TASKS_MC, T=300, n_actions=4, horizon=80, device=device
+)
+
+print(f"\nRegret cumulativo medio finale: {mean_regret[-1]:.2f} ± {std_regret[-1]:.2f}")
+
+####################################################################################################
+#GRAFICO#
+####################################################################################################
+
+import matplotlib.pyplot as plt
+
+T_plot = mean_regret.shape[0]
+t_axis = np.arange(1, T_plot + 1)
+
+fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+
+# --- Grafico 1: regret cumulativo medio, con banda di errore ---
+axes[0].plot(t_axis, mean_regret, label="Regret cumulativo medio (TS-Gen)", color="tab:blue")
+axes[0].fill_between(t_axis, mean_regret - std_regret, mean_regret + std_regret,
+                     alpha=0.2, color="tab:blue", label="±1 std")
+
+# Curva di riferimento c*sqrt(t), scalata per passare vicino all'ultimo punto
+c = mean_regret[-1] / np.sqrt(T_plot)
+axes[0].plot(t_axis, c * np.sqrt(t_axis), "--", color="gray", label=r"riferimento $c\sqrt{t}$")
+
+axes[0].set_xlabel("Decision times (t)")
+axes[0].set_ylabel("Regret cumulativo")
+axes[0].set_title("Regret cumulativo medio su task")
+axes[0].legend()
+
+# --- Grafico 2: regret medio PER PERIODO (deve tendere a scendere verso 0) ---
+avg_per_period = mean_regret / t_axis
+axes[1].plot(t_axis, avg_per_period, color="tab:orange")
+axes[1].set_xlabel("Decision times (t)")
+axes[1].set_ylabel("Regret medio per periodo")
+axes[1].set_title("Regret / t (deve tendere a calare)")
+
+plt.tight_layout()
+plt.savefig("regret_plot.png", dpi=150)
+plt.show()
