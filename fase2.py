@@ -2,6 +2,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from sklearn.linear_model import LogisticRegression
+import matplotlib.pyplot as plt
 
 def sigmoid(w):
     return 1.0 / (1.0 + np.exp(-w))
@@ -64,7 +65,7 @@ def build_query_input(Z, X_i, S_inv, XY_mean, repeat_factor=REPEAT_FACTOR):
 
 def generate_bandit_task(rng, T, n_actions, d_x=D_X, d_z=D_Z):
     """
-    Un task bandit completo: contesti X_1:T condivisi da tutte le azioni,
+    Un task bandit completo VERO: contesti X_1:T condivisi da tutte le azioni,
     e per ogni azione l'intera tabella di potential outcomes Y_1:T^(a)
     (formula (10), Appendix B.1.1). L'agente vedrà solo un sottoinsieme
     di questi outcome, in base a quali azioni sceglie nel tempo.
@@ -175,20 +176,6 @@ def generative_ts(model, task, T, n_actions, horizon, seed=0, device="cpu", verb
 
     return {"rewards": rewards, "actions": chosen_actions}
 
-#rng_task = np.random.default_rng(42)
-#T_TEST = 100
-#N_ACTIONS_TEST = 3
-#HORIZON = 30  # troncamento: genera al massimo 10 passi nel futuro oltre a t
-
-#task = generate_bandit_task(rng_task, T=T_TEST, n_actions=N_ACTIONS_TEST)
-
-#result = generative_ts(model, task, T=T_TEST, n_actions=N_ACTIONS_TEST,
-#                       horizon=HORIZON, seed=0, device=device)
-
-#print("\nReward totale:", sum(result["rewards"]))
-#print("Reward medio:", np.mean(result["rewards"]))
-#print("Distribuzione azioni scelte:", np.bincount(result["actions"], minlength=N_ACTIONS_TEST))
-
 #######################################################################################################################
 #REGRET COMPUTATION#
 #######################################################################################################################
@@ -235,80 +222,191 @@ def compute_regret(task, result, n_actions):
         "avg_regret": cumulative_regret / np.arange(1, T + 1),
     }
 
-#regret_info = compute_regret(task, result, N_ACTIONS_TEST)
 
-#print("Azioni oracle:       ", regret_info["oracle_actions"])
-#print("Azioni agente (TS):  ", result["actions"])
-#print("Regret per periodo:  ", regret_info["per_period_regret"])
-#print("Regret cumulativo:   ", regret_info["cumulative_regret"])
-#print(f"\nRegret cumulativo finale: {regret_info['cumulative_regret'][-1]}")
-#print(f"Regret medio per periodo (finale): {regret_info['avg_regret'][-1]:.3f}")    
+############################################################################################################
+#COMPARISON#
+############################################################################################################
+
+#GREEDY AND EPSILON-GREEDY
+class ActionHistory:
+    """Tiene traccia delle sole osservazioni REALI per una singola azione."""
+    def __init__(self, d_x):
+        self.d_x = d_x
+        self.X_list = []
+        self.Y_list = []
+
+    def add(self, X_t, Y_t):
+        self.X_list.append(X_t)
+        self.Y_list.append(Y_t)
+
+    def as_arrays(self):
+        if len(self.X_list) == 0:
+            return np.zeros((0, self.d_x)), np.zeros((0,))
+        return np.array(self.X_list), np.array(self.Y_list)
+
+def predict_with_p_theta(model, Z_a, X_t, hist_a, device="cpu", ridge=1.0):
+    """Predice E[Y|storia reale, X_t] con p_theta, SENZA generare nulla (query singola)."""
+    X_obs, Y_obs = hist_a.as_arrays()
+    stats = RunningStats(hist_a.d_x, ridge=ridge)
+    for X_i, Y_i in zip(X_obs, Y_obs):
+        stats.update(X_i, Y_i)
+    S_inv, XY_mean = stats.current()
+    input_vec = build_query_input(Z_a, X_t, S_inv, XY_mean)
+    with torch.no_grad():
+        logit = model(torch.from_numpy(input_vec).unsqueeze(0).to(device))
+        return torch.sigmoid(logit).item()
 
 
-##################################################################################################
-#PER ESSERE PRECISI FACCIAMO LA MEDIA DEI RISULTATI OTTENUTI SU PIU' TASK DIVERSI#
-##################################################################################################
+def run_greedy(model, task, T, n_actions, epsilon=0.0, seed=0, device="cpu"):
+    rng = np.random.default_rng(seed)
+    X_true = task["X"]
+    Z_per_action = [a["Z"] for a in task["actions"]]
+    histories = [ActionHistory(D_X) for _ in range(n_actions)]
+    rewards, actions = [], []
 
-def run_monte_carlo(model, n_tasks, T, n_actions, horizon, base_seed=0, device="cpu"):
-    all_cum_regret = np.zeros((n_tasks, T))
+    for t in range(T):
+        X_t = X_true[t]
+        if epsilon > 0 and rng.random() < epsilon:
+            A_t = int(rng.integers(0, n_actions))
+        else:
+            preds = [predict_with_p_theta(model, Z_per_action[a], X_t, histories[a], device)
+                     for a in range(n_actions)]
+            A_t = int(np.argmax(preds))
+
+        Y_t = int(task["actions"][A_t]["Y"][t])
+        histories[A_t].add(X_t, Y_t)
+        rewards.append(Y_t)
+        actions.append(A_t)
+
+    return {"rewards": rewards, "actions": actions}
+
+
+#TS-LINEAR
+def run_ts_linear(task, T, n_actions, d_x=D_X, noise_var=0.25, seed=0):
+    """
+    Bayesian linear regression per azione, prior N(0, I), rumore N(0, noise_var).
+    Non usa p_theta: lavora solo su (X_t) e sugli outcome realmente osservati.
+    """
+    rng = np.random.default_rng(seed)
+    X_true = task["X"]
+    histories = [ActionHistory(d_x) for _ in range(n_actions)]
+    rewards, actions = [], []
+
+    for t in range(T):
+        X_t = X_true[t]
+        preds = []
+        for a in range(n_actions):
+            X_obs, Y_obs = histories[a].as_arrays()
+            if X_obs.shape[0] == 0:
+                Sigma = np.eye(d_x)
+                mu = np.zeros(d_x)
+            else:
+                precision = np.eye(d_x) + (X_obs.T @ X_obs) / noise_var
+                Sigma = np.linalg.inv(precision)
+                mu = Sigma @ (X_obs.T @ Y_obs) / noise_var
+            beta_sample = rng.multivariate_normal(mu, Sigma)
+            preds.append(X_t @ beta_sample)
+        A_t = int(np.argmax(preds))
+
+        Y_t = int(task["actions"][A_t]["Y"][t])
+        histories[A_t].add(X_t, Y_t)
+        rewards.append(Y_t)
+        actions.append(A_t)
+
+    return {"rewards": rewards, "actions": actions}
+
+
+#LIN-UCB
+def run_linucb(task, T, n_actions, d_x=D_X, alpha=0.1, seed=0):
+    X_true = task["X"]
+    histories = [ActionHistory(d_x) for _ in range(n_actions)]
+    rewards, actions = [], []
+
+    for t in range(T):
+        X_t = X_true[t]
+        ucb_scores = []
+        for a in range(n_actions):
+            X_obs, Y_obs = histories[a].as_arrays()
+            A_mat = np.eye(d_x) + (X_obs.T @ X_obs if X_obs.shape[0] > 0 else 0)
+            b_vec = X_obs.T @ Y_obs if X_obs.shape[0] > 0 else np.zeros(d_x)
+            A_inv = np.linalg.inv(A_mat)
+            theta_hat = A_inv @ b_vec
+            mean_est = X_t @ theta_hat
+            bonus = alpha * np.sqrt(X_t @ A_inv @ X_t)
+            ucb_scores.append(mean_est + bonus)
+        A_t = int(np.argmax(ucb_scores))
+
+        Y_t = int(task["actions"][A_t]["Y"][t])
+        histories[A_t].add(X_t, Y_t)
+        rewards.append(Y_t)
+        actions.append(A_t)
+
+    return {"rewards": rewards, "actions": actions}
+
+#RUN ALL
+
+ALGORITHMS = {
+    "TS-Gen": lambda model, task, T, n_actions, seed, device:
+        generative_ts(model, task, T=T, n_actions=n_actions, horizon=HORIZON,
+                      seed=seed, device=device, verbose=False),
+    "Greedy": lambda model, task, T, n_actions, seed, device:
+        run_greedy(model, task, T, n_actions, epsilon=0.0, seed=seed, device=device),
+    "Epsilon-Greedy": lambda model, task, T, n_actions, seed, device:
+        run_greedy(model, task, T, n_actions, epsilon=0.1, seed=seed, device=device),
+    "TS-Linear": lambda model, task, T, n_actions, seed, device:
+        run_ts_linear(task, T, n_actions, seed=seed),
+    "LinUCB": lambda model, task, T, n_actions, seed, device:
+        run_linucb(task, T, n_actions, seed=seed),
+}
+
+def run_monte_carlo_all(model, algo_names, n_tasks, T, n_actions, base_seed=0, device="cpu"):
+    results = {name: np.zeros((n_tasks, T)) for name in algo_names}
 
     for m in range(n_tasks):
         rng_task = np.random.default_rng(base_seed + m)
-        task = generate_bandit_task(rng_task, T=T, n_actions=n_actions)
+        task = generate_bandit_task(rng_task, T=T, n_actions=n_actions)  # STESSO task per tutti
 
-        result = generative_ts(model, task, T=T, n_actions=n_actions,
-                               horizon=horizon, seed=base_seed + m,
-                               device=device, verbose=False)
+        for name in algo_names:
+            algo_fn = ALGORITHMS[name]
+            out = algo_fn(model, task, T, n_actions, base_seed + m, device)
+            regret_info = compute_regret(task, out, n_actions)
+            results[name][m] = regret_info["cumulative_regret"]
 
-        regret_info = compute_regret(task, result, n_actions)
-        all_cum_regret[m] = regret_info["cumulative_regret"]
+        print(f"Task {m+1}/{n_tasks} completato")
 
-        print(f"Task {m+1}/{n_tasks} completato - regret cumulativo finale: {all_cum_regret[m, -1]:.0f}")
+    mean_results = {name: results[name].mean(axis=0) for name in algo_names}
+    std_results = {name: results[name].std(axis=0) for name in algo_names}
+    return results, mean_results, std_results
 
-    mean_regret = all_cum_regret.mean(axis=0)
-    std_regret = all_cum_regret.std(axis=0)
-    return all_cum_regret, mean_regret, std_regret
+T_RUN = 300
+HORIZON = 80
+N_ACTIONS_RUN = 4
+N_TASKS_MC = 40
 
+algo_names = ["TS-Gen", "Greedy", "Epsilon-Greedy", "TS-Linear", "LinUCB"]
 
-N_TASKS_MC = 40   # inizia piccolo, poi scala se i tempi lo permettono
-all_regret, mean_regret, std_regret = run_monte_carlo(
-    model, n_tasks=N_TASKS_MC, T=300, n_actions=4, horizon=80, device=device
+all_results, mean_results, std_results = run_monte_carlo_all(
+    model, algo_names, n_tasks=N_TASKS_MC, T=T_RUN, n_actions=N_ACTIONS_RUN,
+    base_seed=0, device=device
 )
 
-print(f"\nRegret cumulativo medio finale: {mean_regret[-1]:.2f} ± {std_regret[-1]:.2f}")
+for name in algo_names:
+    print(f"{name}: regret finale = {mean_results[name][-1]:.2f} ± {std_results[name][-1]:.2f}")
 
-####################################################################################################
-#GRAFICO#
-####################################################################################################
+#PLOT
+t_axis = np.arange(1, T_RUN + 1)
+colors = {"TS-Gen": "tab:blue", "Greedy": "tab:orange", "Epsilon-Greedy": "tab:green",
+          "TS-Linear": "tab:red", "LinUCB": "tab:purple"}
 
-import matplotlib.pyplot as plt
+plt.figure(figsize=(8, 6))
+for name in algo_names:
+    plt.plot(t_axis, mean_results[name], label=name, color=colors[name])
+    
 
-T_plot = mean_regret.shape[0]
-t_axis = np.arange(1, T_plot + 1)
-
-fig, axes = plt.subplots(1, 2, figsize=(13, 5))
-
-# --- Grafico 1: regret cumulativo medio, con banda di errore ---
-axes[0].plot(t_axis, mean_regret, label="Regret cumulativo medio (TS-Gen)", color="tab:blue")
-axes[0].fill_between(t_axis, mean_regret - std_regret, mean_regret + std_regret,
-                     alpha=0.2, color="tab:blue", label="±1 std")
-
-# Curva di riferimento c*sqrt(t), scalata per passare vicino all'ultimo punto
-c = mean_regret[-1] / np.sqrt(T_plot)
-axes[0].plot(t_axis, c * np.sqrt(t_axis), "--", color="gray", label=r"riferimento $c\sqrt{t}$")
-
-axes[0].set_xlabel("Decision times (t)")
-axes[0].set_ylabel("Regret cumulativo")
-axes[0].set_title("Regret cumulativo medio su task")
-axes[0].legend()
-
-# --- Grafico 2: regret medio PER PERIODO (deve tendere a scendere verso 0) ---
-avg_per_period = mean_regret / t_axis
-axes[1].plot(t_axis, avg_per_period, color="tab:orange")
-axes[1].set_xlabel("Decision times (t)")
-axes[1].set_ylabel("Regret medio per periodo")
-axes[1].set_title("Regret / t (deve tendere a calare)")
-
+plt.xlabel("Decision times (t)")
+plt.ylabel("Regret")
+plt.title(f"Average Regret Over Timesteps ({N_TASKS_MC} task, T={T_RUN})")
+plt.legend()
 plt.tight_layout()
-plt.savefig("regret_plot.png", dpi=150)
+plt.savefig("regret_comparison.png", dpi=150)
 plt.show()
