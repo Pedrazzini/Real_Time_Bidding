@@ -323,7 +323,7 @@ def run_ts_linear(task, T, n_actions, d_x=D_X, noise_var=0.25, seed=0):
                 mu = Sigma @ (X_obs.T @ Y_obs) / noise_var
             beta_sample = rng.multivariate_normal(mu, Sigma)
             preds.append(X_t @ beta_sample)
-        A_t = int(np.argmax(to_prob(preds, PROB_MODE) * prices))
+        A_t = int(np.argmax(to_prob(preds, "clip") * prices))
 
         Y_t = int(task["actions"][A_t]["Y"][t])
         histories[A_t].add(X_t, Y_t)
@@ -352,7 +352,7 @@ def run_linucb(task, T, n_actions, d_x=D_X, alpha=0.1, seed=0):
             mean_est = X_t @ theta_hat
             bonus = alpha * np.sqrt(X_t @ A_inv @ X_t)
             ucb_scores.append(mean_est + bonus)
-        A_t = int(np.argmax(to_prob(ucb_scores, PROB_MODE) * prices))
+        A_t = int(np.argmax(to_prob(ucb_scores, "clip") * prices))
 
         Y_t = int(task["actions"][A_t]["Y"][t])
         histories[A_t].add(X_t, Y_t)
