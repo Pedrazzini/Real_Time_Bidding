@@ -6,6 +6,9 @@ Il dataset offline e p_theta (p_theta.pt) sono quelli GIA' prodotti: qui si cari
 Il file si puo' anche importare (le definizioni sono separate dal blocco "__main__").
 """
 import time
+import warnings
+from sklearn.neural_network import MLPClassifier
+from sklearn.exceptions import ConvergenceWarning
 import numpy as np
 import torch
 import torch.nn as nn
@@ -133,16 +136,27 @@ def impute_missing_outcomes(model, Z_per_action, X_hat, observed_times, Y_hist,
         Y_hat_per_action[a] = Y_hat_a
     return Y_hat_per_action
 
+def make_policy_model(policy, seed=0):
+    if policy == "logistic":
+        return LogisticRegression()
+    if policy == "mlp":
+        # MLP di default di scikit-learn, come in Appendice B.3.1 del paper:
+        # 1 hidden layer da 100 ReLU, Adam lr=1e-3, batch 200, max_iter=200
+        return MLPClassifier(random_state=seed)
+    raise ValueError(f"policy sconosciuta: {policy}")
 
-def fit_oracle_policies(X_hat, Y_hat_per_action, n_actions):
+
+def fit_oracle_policies(X_hat, Y_hat_per_action, n_actions, policy="logistic", seed=0):
     policies = []
     for a in range(n_actions):
         y = np.array([Y_hat_per_action[a][s] for s in range(X_hat.shape[0])])
         if len(np.unique(y)) < 2:
             policies.append(("constant", float(y.mean())))
         else:
-            clf = LogisticRegression()
-            clf.fit(X_hat, y)
+            clf = make_policy_model(policy, seed + a)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", ConvergenceWarning)   # max_iter=200 spesso non converge
+                clf.fit(X_hat, y)
             policies.append(("model", clf))
     return policies
 
@@ -259,20 +273,21 @@ class LinUCBAgent(BaseAgent):
 
 
 class TSGenAgent(BaseAgent):
-    """Generative TS: a ogni t imputa gli outcome mancanti con p_theta (orizzonte futuro
-    troncato a `horizon`), fitta una logistica per azione sul dataset imputato e usa
-    le sue probabilita' come CTR stimato."""
     name = "TS-Gen"
 
-    def __init__(self, model, n_actions, prices, Z_per_action, T, horizon, seed=0, device="cpu"):
+    def __init__(self, model, n_actions, prices, Z_per_action, T, horizon,
+                 seed=0, device="cpu", policy="logistic"):
         super().__init__(n_actions, prices, Z_per_action, seed)
         self.model = model
         self.T = T
         self.horizon = horizon
         self.device = device
-        self.X_seen = []                                       # contesti reali visti (indice = t)
+        self.policy = policy
+        self.X_seen = []
         self.observed_times = {a: [] for a in range(n_actions)}
         self.Y_hist = {a: {} for a in range(n_actions)}
+        self.t_impute = 0.0          # tempo totale di imputazione
+        self.t_fit = 0.0             # tempo totale di fitting della policy
 
     def estimate_ctr(self, X_t, t):
         self.X_seen.append(X_t)
@@ -282,9 +297,14 @@ class TSGenAgent(BaseAgent):
         if eff_T > t + 1:
             X_hat[t + 1:] = self.rng.normal(size=(eff_T - (t + 1), D_X))
 
+        t0 = time.perf_counter()
         Y_hat = impute_missing_outcomes(self.model, self.Z, X_hat, self.observed_times,
                                         self.Y_hist, self.n_actions, self.rng, self.device)
-        policies = fit_oracle_policies(X_hat, Y_hat, self.n_actions)
+        t1 = time.perf_counter()
+        policies = fit_oracle_policies(X_hat, Y_hat, self.n_actions,
+                                       policy=self.policy, seed=t * self.n_actions)
+        self.t_impute += t1 - t0
+        self.t_fit += time.perf_counter() - t1
         return predict_probs(policies, X_t)
 
     def update(self, a, X_t, Y_t, t):
@@ -292,10 +312,18 @@ class TSGenAgent(BaseAgent):
         self.Y_hist[a][t] = Y_t
 
 
+class TSGenMLPAgent(TSGenAgent):
+    """TS-Gen con policy MLP al posto della regressione logistica."""
+    name = "TS-Gen-MLP"
+
+    def __init__(self, model, n_actions, prices, Z_per_action, T, horizon, seed=0, device="cpu"):
+        super().__init__(model, n_actions, prices, Z_per_action, T, horizon,
+                         seed=seed, device=device, policy="mlp")
+
+
 # ----------------------------------------------------------------------------------------------
-# ASTA FIRST-PRICE (per impression). 5 agenti, 5 slot: tutti vincono sempre.
-# Y_t^(a) e' unico per prodotto: se due agenti propongono lo stesso prodotto, l'acquisto
-# e' attribuito a entrambi.
+# ASTA FIRST-PRICE (per impression). 5 agenti, 1 slot.
+
 # ----------------------------------------------------------------------------------------------
 
 SHADING = 0.5
@@ -337,12 +365,17 @@ def run_auction(task, agents, T, shading=SHADING, rng=None):
     return out
 
 
-def make_agents(model, task, T, horizon, seed, device="cpu"):
+
+def make_agents(model, task, T, horizon, seed, device="cpu", include_mlp=False):
     prices = [a["price"] for a in task["actions"]]
     Z = [a["Z"] for a in task["actions"]]
     n = len(prices)
+
+    # TS-Gen con policy MLP SOSTITUISCE TS-Gen con policy logistica (non si aggiunge)
+    ts_gen_cls = TSGenMLPAgent if include_mlp else TSGenAgent
+
     return [
-        TSGenAgent(model, n, prices, Z, T=T, horizon=horizon, seed=seed + 1, device=device),
+        ts_gen_cls(model, n, prices, Z, T=T, horizon=horizon, seed=seed + 1, device=device),
         GreedyAgent(model, n, prices, Z, epsilon=0.0, seed=seed + 2, device=device),
         GreedyAgent(model, n, prices, Z, epsilon=0.1, seed=seed + 3, device=device),
         TSLinearAgent(n, prices, Z, seed=seed + 4),
@@ -350,14 +383,15 @@ def make_agents(model, task, T, horizon, seed, device="cpu"):
     ]
 
 
-def run_monte_carlo_auctions(model, n_tasks, T, n_actions, horizon, base_seed=0, device="cpu"):
+def run_monte_carlo_auctions(model, n_tasks, T, n_actions, horizon, base_seed=0, device="cpu", include_mlp=False):
     results = None
     for m in range(n_tasks):
         t0 = time.time()
         rng_task = np.random.default_rng(base_seed + m)
         task = generate_bandit_task(rng_task, T=T, n_actions=n_actions)   # stesso task per tutti
-        agents = make_agents(model, task, T, horizon, seed=1000 * (base_seed + m), device=device)
+        agents = make_agents(model, task, T, horizon, seed=1000 * (base_seed + m), device=device, include_mlp=include_mlp)
         out = run_auction(task, agents, T, rng=np.random.default_rng(10**6 + base_seed + m))
+        print(f"  TS-Gen: impute {agents[0].t_impute:.1f}s | fit {agents[0].t_fit:.1f}s")
 
         if results is None:
             results = {ag.name: {k: np.zeros((n_tasks, T)) for k in METRICS} for ag in agents}
@@ -411,9 +445,9 @@ if __name__ == "__main__":
     T_RUN = 600
     HORIZON = 100
     N_ACTIONS_RUN = 5        # prodotti nel catalogo
-    N_TASKS_MC = 25
+    N_TASKS_MC = 5
 
     results = run_monte_carlo_auctions(model, N_TASKS_MC, T_RUN, N_ACTIONS_RUN, HORIZON,
-                                       base_seed=0, device=device)
+                                       base_seed=0, device=device, include_mlp=True)
     summarize(results)
     plot_results(results, T_RUN, N_TASKS_MC)
