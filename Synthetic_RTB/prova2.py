@@ -23,6 +23,29 @@ D_Z = 2
 REPEAT_FACTOR = 100
 INPUT_DIM = D_Z + D_X + REPEAT_FACTOR * (D_X * D_X + D_X)  # 3007
 PRICE_MIN, PRICE_MAX = 6.0, 6.1   # prezzi in unita' monetarie (NON normalizzati)
+T_REF = 600                       # STESSO valore usato in build_distillation_dataset.py
+_IU = np.triu_indices(D_X)
+
+def dataset_features(X, y, t_ref=T_REF):
+    n = X.shape[0]
+    xy = (X * y[:, None]).mean(axis=0)
+    xx = np.einsum("ni,nj->ij", X, X) / n
+    xxy = np.einsum("n,ni,nj->ij", y, X, X) / n
+    return np.concatenate([[n / t_ref, y.mean()], xy, xx[_IU], xxy[_IU], X.mean(axis=0)]).astype(np.float32)
+
+
+class PolicyStudent(nn.Module):
+    def __init__(self, d_in, hidden=128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(d_in, hidden), nn.ReLU(),
+            nn.Linear(hidden, hidden), nn.ReLU(),
+            nn.Linear(hidden, hidden), nn.ReLU(),
+            nn.Linear(hidden, 1),
+        )
+
+    def forward(self, x):
+        return self.net(x).squeeze(-1)
 
 
 def sigmoid(w):
@@ -320,6 +343,56 @@ class TSGenMLPAgent(TSGenAgent):
         super().__init__(model, n_actions, prices, Z_per_action, T, horizon,
                          seed=seed, device=device, policy="mlp")
 
+class TSGenDistilledAgent(TSGenAgent):
+    """TS-Gen con policy distillata: stessa imputazione, ma al posto del fit dell'MLP
+    un solo forward della rete studente."""
+    name = "TS-Gen-Distilled"
+
+    def __init__(self, model, n_actions, prices, Z_per_action, T, horizon,
+                 student_path="policy_student.pt", seed=0, device="cpu"):
+        super().__init__(model, n_actions, prices, Z_per_action, T, horizon,
+                         seed=seed, device=device, policy="mlp")
+        ckpt = torch.load(student_path, map_location="cpu")
+        self.student = PolicyStudent(ckpt["d_in"], ckpt["hidden"])
+        self.student.load_state_dict(ckpt["state_dict"])
+        self.student.eval()
+        self.F_mean = np.asarray(ckpt["F_mean"], dtype=np.float32)
+        self.F_std = np.asarray(ckpt["F_std"], dtype=np.float32)
+        self.Q_mean = np.asarray(ckpt["Q_mean"], dtype=np.float32)
+        self.Q_std = np.asarray(ckpt["Q_std"], dtype=np.float32)
+
+    def estimate_ctr(self, X_t, t):
+        self.X_seen.append(X_t)
+        eff_T = min(self.T, t + 1 + self.horizon)
+        X_hat = np.zeros((eff_T, D_X))
+        X_hat[:t + 1] = np.array(self.X_seen)
+        if eff_T > t + 1:
+            X_hat[t + 1:] = self.rng.normal(size=(eff_T - (t + 1), D_X))
+
+        t0 = time.perf_counter()
+        Y_hat = impute_missing_outcomes(self.model, self.Z, X_hat, self.observed_times,
+                                        self.Y_hist, self.n_actions, self.rng, self.device)
+        t1 = time.perf_counter()
+
+        probs = np.zeros(self.n_actions)
+        q = (X_t - self.Q_mean) / self.Q_std
+        rows, idx = [], []
+        for a in range(self.n_actions):
+            y = np.array([Y_hat[a][s] for s in range(eff_T)], dtype=np.float64)
+            if len(np.unique(y)) < 2:
+                probs[a] = y.mean()                       # come l'insegnante
+            else:
+                f = (dataset_features(X_hat, y) - self.F_mean) / self.F_std
+                rows.append(np.concatenate([q, f]))
+                idx.append(a)
+        if rows:
+            with torch.no_grad():
+                inp = torch.from_numpy(np.stack(rows).astype(np.float32))
+                probs[idx] = torch.sigmoid(self.student(inp)).numpy()
+
+        self.t_impute += t1 - t0
+        self.t_fit += time.perf_counter() - t1
+        return probs
 
 # ----------------------------------------------------------------------------------------------
 # ASTA FIRST-PRICE (per impression). 5 agenti, 1 slot.
@@ -366,13 +439,14 @@ def run_auction(task, agents, T, shading=SHADING, rng=None):
 
 
 
-def make_agents(model, task, T, horizon, seed, device="cpu", include_mlp=False):
+def make_agents(model, task, T, horizon, seed, device="cpu", ts_gen_variant="logistic"):
     prices = [a["price"] for a in task["actions"]]
     Z = [a["Z"] for a in task["actions"]]
     n = len(prices)
 
-    # TS-Gen con policy MLP SOSTITUISCE TS-Gen con policy logistica (non si aggiunge)
-    ts_gen_cls = TSGenMLPAgent if include_mlp else TSGenAgent
+    ts_gen_cls = {"logistic": TSGenAgent,
+                  "mlp": TSGenMLPAgent,
+                  "distilled": TSGenDistilledAgent}[ts_gen_variant]
 
     return [
         ts_gen_cls(model, n, prices, Z, T=T, horizon=horizon, seed=seed + 1, device=device),
@@ -383,13 +457,13 @@ def make_agents(model, task, T, horizon, seed, device="cpu", include_mlp=False):
     ]
 
 
-def run_monte_carlo_auctions(model, n_tasks, T, n_actions, horizon, base_seed=0, device="cpu", include_mlp=False):
+def run_monte_carlo_auctions(model, n_tasks, T, n_actions, horizon, base_seed=0, device="cpu", ts_gen_variant="logistic"):
     results = None
     for m in range(n_tasks):
         t0 = time.time()
         rng_task = np.random.default_rng(base_seed + m)
         task = generate_bandit_task(rng_task, T=T, n_actions=n_actions)   # stesso task per tutti
-        agents = make_agents(model, task, T, horizon, seed=1000 * (base_seed + m), device=device, include_mlp=include_mlp)
+        agents = make_agents(model, task, T, horizon, seed=1000 * (base_seed + m), device=device, ts_gen_variant = ts_gen_variant)
         out = run_auction(task, agents, T, rng=np.random.default_rng(10**6 + base_seed + m))
         print(f"  TS-Gen: impute {agents[0].t_impute:.1f}s | fit {agents[0].t_fit:.1f}s")
 
@@ -448,6 +522,6 @@ if __name__ == "__main__":
     N_TASKS_MC = 5
 
     results = run_monte_carlo_auctions(model, N_TASKS_MC, T_RUN, N_ACTIONS_RUN, HORIZON,
-                                       base_seed=0, device=device, include_mlp=True)
+                                       base_seed=0, device=device, ts_gen_variant="distilled")
     summarize(results)
     plot_results(results, T_RUN, N_TASKS_MC)
